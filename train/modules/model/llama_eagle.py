@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from typing import List, Optional, Union
-
+#from transformers import Llama4Model
 from transformers.models.llama.modeling_llama import LlamaModel
 
 from transformers.cache_utils import Cache

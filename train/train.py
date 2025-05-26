@@ -1,14 +1,26 @@
 import json
 import os
 import torch
-import wandb
+#import wandb
 import random
+import argparse
+from datasets import load_dataset
 
 from safetensors import safe_open
 
+from transformers import (
+    GenerationConfig,
+    Llama4Config,
+    Llama4ForConditionalGeneration,
+    Llama4ImageProcessorFast,
+    Llama4Processor,
+    Llama4TextConfig,
+    Llama4VisionConfig,
+    PreTrainedTokenizerFast,
+)
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from transformers import AutoTokenizer, TrainingArguments
+from transformers import AutoTokenizer, TrainingArguments, AutoModelForCausalLM
 
 from modules.model.llama_eagle import LlamaForCausalLMEagle
 from modules.data.data import (
@@ -19,10 +31,20 @@ from modules.data.data import (
 )
 from modules.trainer.trainer import EagleTrainer
 
-wandb.init(project="BaldEagle")
-wandb_run_name = wandb.run.name
 
-path = "models/llama-8b/"
+parser = argparse.ArgumentParser(description="Train BaldEagle model")
+parser.add_argument("--data_dir", type=str, default="outdir0", help="Directory containing the generated data")
+parser.add_argument("--model_path", type=str, default="/root/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659/", help="Path to the base Llama model")
+parser.add_argument("--generate_on_fly", action="store_true", help="Generate data on the fly instead of loading from disk")
+parser.add_argument("--max_sharegpt_samples", type=int, default=100, help="Maximum number of ShareGPT samples to download")
+parser.add_argument("--max_ultrachat_samples", type=int, default=100, help="Maximum number of UltraChat samples to download")
+args = parser.parse_args()
+
+wandb_run_name="test"
+#wandb.init(project="BaldEagle")
+#wandb_run_name = wandb.run.name
+
+path = args.model_path
 
 # -------------------------------- Load original Llama weights --------------------------------
 
@@ -45,6 +67,12 @@ with safe_open(os.path.join(path, lm_head_path), framework="pt", device="cpu") a
 tokenizer = AutoTokenizer.from_pretrained(path)
 tokenizer.pad_token = tokenizer.eos_token
 
+target_model = AutoModelForCausalLM.from_pretrained(
+    path,
+    device_map="auto",
+    torch_dtype=torch.bfloat16
+)
+
 model_args = LlamaConfig(
     vocab_size=vocab_size,
     hidden_size=hidden_dim,
@@ -56,10 +84,13 @@ model_args = LlamaConfig(
     num_attention_heads=32,
     tie_word_embeddings=False,
 )
+#model_args = AutoConfig.from_pretrained("config.json", local_files_only=True)
+#model_args = Llama4Config(
+#    num_hidden_layers=1,
+#)
 
 draft_model = LlamaForCausalLMEagle(model_args)
 draft_model.load_embedding_weights(tensor)
-draft_model.to("cuda:0")
 draft_model.embed_tokens.weight.requires_grad = False
 
 # Load head
@@ -73,24 +104,19 @@ with safe_open(os.path.join(path, head_path), framework="pt", device="cpu") as f
     tensor = tensor_slice[:, :hidden_dim].float()
 
 head.weight.data = tensor
-head.to("cuda:0")
 head.eval()
 
-# -------------------------------- Load data --------------------------------
-
-sharegpt_datapaths = list_local_files("/mnt/ssd4tb/sharegpt_grouped_5k/")
-ultra_chat_datapaths = list_local_files("/mnt/ssd4tb/ultrachat_0_199999_mufp16/")
-
-combined_data_paths = (
-    sharegpt_datapaths[: int(len(sharegpt_datapaths) * 0.95)] + ultra_chat_datapaths
-)
-random.Random(42).shuffle(combined_data_paths)
-eval_data_paths = sharegpt_datapaths[int(len(sharegpt_datapaths) * 0.95) :][:100]
-
+max_len=100
 eagle_train_dataset = EagleLocalDataset(
-    combined_data_paths, transform=AddUniformNoise(std=0.5)
+    target_model=target_model,
+    transform=AddUniformNoise(std=0.5),
+    tokenizer=tokenizer,
 )
-eagle_test_dataset = EagleLocalDataset(eval_data_paths)
+eagle_test_dataset = EagleLocalDataset(
+    target_model=target_model,
+    tokenizer=tokenizer,
+    is_eval=True,
+)
 
 eagle_collator = DataCollatorWithPadding()
 
@@ -105,7 +131,7 @@ training_args = TrainingArguments(
     remove_unused_columns=False,
     bf16=True,
     fp16=False,
-    dataloader_num_workers=4,
+    dataloader_num_workers=0,
     warmup_ratio=0.01,
     learning_rate=1e-4,  # 1e-3
     lr_scheduler_type="constant",  # Placeholder, we override it in the trainer
@@ -120,6 +146,7 @@ training_args = TrainingArguments(
     save_steps=0.1,  # saves every 10% of training
     save_total_limit=3,
 )
+
 
 trainer = EagleTrainer(
     model=draft_model,
